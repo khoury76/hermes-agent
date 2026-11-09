@@ -39,7 +39,13 @@ class TestKimiCodingAnthropicThinking:
         assert "thinking" not in kwargs
 
     def test_non_kimi_third_party_still_gets_thinking(self) -> None:
-        """MiniMax and other third-party Anthropic endpoints must retain thinking."""
+        """MiniMax and other third-party Anthropic endpoints must retain thinking.
+
+        MiniMax's global endpoint is the one third-party family that speaks the NATIVE
+        adaptive contract (see agent/anthropic_endpoints.py), so it keeps thinking via
+        ``thinking.type="adaptive"`` + ``output_config.effort`` rather than the manual
+        budget. What matters here is that thinking is retained either way.
+        """
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
@@ -49,6 +55,22 @@ class TestKimiCodingAnthropicThinking:
             max_tokens=4096,
             reasoning_config={"enabled": True, "effort": "medium"},
             base_url="https://api.minimax.io/anthropic",
+        )
+        assert "thinking" in kwargs
+        assert kwargs["thinking"]["type"] == "adaptive"
+        assert kwargs["output_config"] == {"effort": "medium"}
+
+    def test_non_minimax_third_party_still_gets_manual_thinking(self) -> None:
+        """A third-party Anthropic endpoint outside the MiniMax family keeps the manual budget."""
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        kwargs = build_anthropic_kwargs(
+            model="some-third-party-model",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            base_url="https://api.example.com/anthropic",
         )
         assert "thinking" in kwargs
         assert kwargs["thinking"]["type"] == "enabled"

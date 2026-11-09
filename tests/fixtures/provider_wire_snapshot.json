@@ -7013,11 +7013,12 @@
     }
    ],
    "model": "MiniMax-M3",
+   "output_config": {
+    "effort": "high"
+   },
    "system": "You are a test agent.",
-   "temperature": 1,
    "thinking": {
-    "budget_tokens": 16000,
-    "type": "enabled"
+    "type": "adaptive"
    },
    "tool_choice": {
     "type": "auto"
@@ -7381,11 +7382,12 @@
     }
    ],
    "model": "MiniMax-M3",
+   "output_config": {
+    "effort": "high"
+   },
    "system": "You are a test agent.",
-   "temperature": 1,
    "thinking": {
-    "budget_tokens": 16000,
-    "type": "enabled"
+    "type": "adaptive"
    },
    "tool_choice": {
     "type": "auto"

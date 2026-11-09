@@ -145,6 +145,21 @@ def _is_minimax_anthropic_endpoint(base_url: str | None) -> bool:
     return _normalized_lower(base_url).startswith(_MINIMAX_ANTHROPIC_PREFIXES)
 
 
+# MiniMax's GLOBAL endpoint speaks the NATIVE adaptive-thinking contract: ``thinking.type=
+# "adaptive"`` + ``output_config.effort`` with the levels low/medium/high/xhigh/max. Its
+# Anthropic-style ``thinking.budget_tokens`` is accepted but IGNORED (8k/32k/64k budgets all
+# produced identical reasoning), so the manual path silently discarded the user's effort
+# choice. The China endpoint is deliberately excluded: the global credential 401s there, so no
+# contract signal was obtainable and guessing would risk a 400 on every turn.
+_MINIMAX_NATIVE_ADAPTIVE_PREFIX = "https://api.minimax.io/anthropic"
+
+
+def _is_minimax_native_adaptive_endpoint(base_url: str | None) -> bool:
+    """True for MiniMax's global Anthropic endpoint, which implements native adaptive thinking
+    (``output_config.effort``) rather than the Anthropic-style thinking budget."""
+    return _normalized_lower(base_url).startswith(_MINIMAX_NATIVE_ADAPTIVE_PREFIX)
+
+
 def _is_azure_anthropic_endpoint(base_url: str | None) -> bool:
     """Azure-hosted Anthropic Messages endpoints serving ``/anthropic``: modern Foundry
     (``*.services.ai.azure.*``) and legacy Azure OpenAI (``*.openai.azure.*``) hosts; opts them

@@ -19,9 +19,9 @@ from utils import normalize_proxy_env_vars
 from agent.anthropic_credentials import _is_oauth_token, anthropic_route_is_oauth, is_native_anthropic_host
 from agent.anthropic_endpoints import (
     _base_url_needs_context_1m_beta, _is_azure_anthropic_endpoint, _is_kimi_coding_endpoint,
-    _is_minimax_anthropic_endpoint, _is_nous_portal_endpoint, _is_opencode_endpoint,
-    _is_third_party_anthropic_endpoint, _model_name_is_kimi_family, _normalize_base_url_text,
-    _requires_bearer_auth,
+    _is_minimax_anthropic_endpoint, _is_minimax_native_adaptive_endpoint, _is_nous_portal_endpoint,
+    _is_opencode_endpoint, _is_third_party_anthropic_endpoint, _model_name_is_kimi_family,
+    _normalize_base_url_text, _requires_bearer_auth,
 )
 from agent.anthropic_message_convert import (
     convert_messages_to_anthropic, convert_tools_to_anthropic, normalize_model_name,
@@ -614,12 +614,17 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
     return system
 
 
-def _thinking_kwargs(reasoning_config: dict[str, Any], model: str, effective_max_tokens: int) -> dict[str, Any]:
+def _thinking_kwargs(reasoning_config: dict[str, Any], model: str, effective_max_tokens: int,
+                     base_url: str | None = None) -> dict[str, Any]:
     """Map ``reasoning_config`` to Anthropic thinking kwargs. Adaptive models (Claude 4.6+,
     Kimi/Moonshot) get ``thinking.type=adaptive`` + ``output_config.effort``; older models and
-    manual-only compat endpoints (MiniMax) get budget_tokens. Haiku through 4.5 gets none. On
-    4.7+ ``thinking.display`` defaults to "omitted", hiding the reasoning Hermes shows in its CLI,
-    so "summarized" is requested to keep the activity feed populated."""
+    manual-only compat endpoints get budget_tokens. Haiku through 4.5 gets none. On 4.7+ ``
+    thinking.display`` defaults to "omitted", hiding the reasoning Hermes shows in its CLI,
+    so "summarized" is requested to keep the activity feed populated.
+
+    ``base_url`` decides the endpoint-specific contract: MiniMax's global endpoint speaks the
+    NATIVE adaptive contract even though its model ids are not Claude.
+    """
     if reasoning_config.get("enabled") is False:
         # Adaptive models think by DEFAULT, so omitting the parameter is not a disable — the user
         # silently keeps paying. Mandatory-thinking models 400 on the disable, so they keep the
@@ -630,6 +635,16 @@ def _thinking_kwargs(reasoning_config: dict[str, Any], model: str, effective_max
     if _is_pre_thinking_haiku(model):
         return {}
     effort = str(reasoning_config.get("effort", "medium")).lower()
+    if _is_minimax_native_adaptive_endpoint(base_url):
+        # MiniMax (global) implements NATIVE adaptive thinking: ``thinking.type=adaptive`` +
+        # ``output_config.effort`` (low/medium/high/xhigh/max). Its Anthropic-style
+        # ``budget_tokens`` is accepted but IGNORED, so the manual path below silently threw
+        # the user's effort choice away — every level reasoned identically. "ultra" is a
+        # Hermes-only label that MiniMax 400s on, so it clamps to "max" through the same map
+        # Anthropic uses. Disabled reasoning stays an omission: MiniMax rejects
+        # ``thinking.type=disabled`` outright and cannot think NOT at all.
+        native_effort = ADAPTIVE_EFFORT_MAP.get(effort, "medium")
+        return {"thinking": {"type": "adaptive"}, "output_config": {"effort": native_effort}}
     if _supports_adaptive_thinking(model):
         adaptive_effort = ADAPTIVE_EFFORT_MAP.get(effort, "medium")
         if adaptive_effort == "xhigh" and not _supports_xhigh_effort(model):
@@ -688,8 +703,9 @@ def build_anthropic_kwargs(
                 "type": "tool", "name": to_wire(tool_choice) if to_wire else tool_choice
             }
     # Map reasoning_config to Anthropic's thinking parameter. Claude 4.6+ models use adaptive thinking +
-    # output_config.effort. Older models use manual thinking with budget_tokens. MiniMax Anthropic-compat
-    # endpoints support thinking (manual mode only, not adaptive). Haiku through 4.5 gets no thinking
+    # output_config.effort. Older models use manual thinking with budget_tokens. MiniMax's GLOBAL
+    # Anthropic-compat endpoint is adaptive too (see _is_minimax_native_adaptive_endpoint); its
+    # China endpoint stays on the manual budget. Haiku through 4.5 gets no thinking
     # request; Haiku 5.5+ is adaptive. Kimi / Moonshot models also use adaptive thinking: their Anthropic-compatible
     # endpoints (api.moonshot.cn/anthropic, api.kimi.com/coding) accept ``thinking.type="adaptive"`` +
     # ``output_config.effort``, and the replay-validation 400s that originally motivated dropping the
@@ -699,7 +715,7 @@ def build_anthropic_kwargs(
     # reasoning blocks stay populated — matching 4.6 behavior and preserving the activity-feed UX during
     # long tool runs.
     if reasoning_config and isinstance(reasoning_config, dict):
-        kwargs.update(_thinking_kwargs(reasoning_config, model, effective_max_tokens))
+        kwargs.update(_thinking_kwargs(reasoning_config, model, effective_max_tokens, base_url=base_url))
     # Safety net so upstream 4.6 -> 4.7 migrations don't need coordinated edits everywhere callers
     # (auxiliary_client, ...) set sampling params.
     if _forbids_sampling_params(model):
