@@ -1,12 +1,47 @@
 """Anthropic Messages API transport: conversion via agent/anthropic_adapter.py, normalization here."""
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
+logger = logging.getLogger(__name__)
+
 _MCP_PREFIX = "mcp__"
 _THINKING_TYPES = ("thinking", "redacted_thinking")
+
+
+def _collect_web_search_sources(block: dict, sources: list) -> None:
+    """Pull ``{"url", "title"}`` source entries out of a server-side web_search block, however
+    deeply the provider nested them (``sources``/``results``/``citations`` lists or bare dicts).
+    Dedupes by URL, preserves first-seen (document) order."""
+    seen = {s.get("url") for s in sources}
+
+    def walk(node):
+        if isinstance(node, dict):
+            url = node.get("url")
+            if isinstance(url, str) and url and url not in seen:
+                seen.add(url)
+                sources.append({"url": url, "title": node.get("title")})
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(block)
+
+
+def _log_server_tool_use(block: dict) -> None:
+    """Debug breadcrumb for a provider-side tool call (MiniMax web_search_20250305 and kin)."""
+    name = block.get("name") or block.get("server_tool_type") or block.get("type")
+    raw_input = block.get("input")
+    tool_input: dict = raw_input if isinstance(raw_input, dict) else {}
+    query = tool_input.get("query") or block.get("query")
+    status = block.get("status")
+    logger.debug("Anthropic server tool use: name=%s query=%r status=%s", name, query, status)
 
 
 def _unprefix_oauth_tool_name(name: str) -> str:
@@ -26,7 +61,7 @@ def _unprefix_oauth_tool_name(name: str) -> str:
 # build_kwargs params forwarded to build_anthropic_kwargs, with the defaults applied when absent.
 _BUILD_KWARG_DEFAULTS = {
     "max_tokens": 16384, "reasoning_config": None, "tool_choice": None, "is_oauth": False, "preserve_dots": False,
-    "context_length": None, "base_url": None, "fast_mode": False, "drop_context_1m_beta": False,
+    "context_length": None, "base_url": None, "fast_mode": False, "drop_context_1m_beta": False, "provider": None,
 }
 
 
@@ -71,6 +106,7 @@ class AnthropicTransport(ProviderTransport):
         # Anthropic signs each thinking block against the blocks PRECEDING it; when thinking
         # interleaves with tool_use the parallel lists lose that order and replay -> HTTP 400.
         ordered_blocks = []
+        web_search_sources: list[dict] = []
         for block in response.content:
             block_dict = _to_plain_data(block)
             # Sanitize at capture so output-only SDK fields never persist and replay (400).
@@ -90,7 +126,31 @@ class AnthropicTransport(ProviderTransport):
                 if strip_tool_prefix and name.startswith(_MCP_PREFIX):
                     name = _unprefix_oauth_tool_name(name)
                 tool_calls.append(ToolCall(id=block.id, name=name, arguments=json.dumps(block.input)))
+            elif isinstance(block_dict, dict) and (
+                block_dict.get("type") == "server_tool_use" or block_dict.get("server_tool_type") == "web_search_call"
+            ):
+                # Provider-side tool (MiniMax web_search_20250305 and kin): log + harvest source
+                # URLs for provider_data, but never surface as a client ToolCall and never an
+                # error — the assistant text stays the payload. Replay sanitizers drop the block
+                # from persisted anthropic_content_blocks (unknown type), which is desired.
+                _log_server_tool_use(block_dict)
+                _collect_web_search_sources(block_dict, web_search_sources)
         provider_data = {"reasoning_details": reasoning_details} if reasoning_details else {}
+        # The streaming path may have pre-merged sources onto the raw message (e.g. collected
+        # from content_block_start events); keep them rather than recomputing from nothing.
+        preexisting = getattr(response, "provider_data", None)
+        if isinstance(preexisting, dict):
+            for key, value in preexisting.items():
+                provider_data.setdefault(key, value)
+        if web_search_sources:
+            # Block-collected sources win on conflict; preexisting (stream-collected) entries
+            # keep first position, deduped by URL.
+            prior = provider_data.get("web_search_sources")
+            if isinstance(prior, list):
+                known = {s.get("url") for s in web_search_sources if isinstance(s, dict)}
+                web_search_sources = [s for s in prior
+                                      if isinstance(s, dict) and s.get("url") not in known] + web_search_sources
+            provider_data["web_search_sources"] = web_search_sources
         stop_details = _to_plain_data(getattr(response, "stop_details", None))
         if stop_details is not None:
             provider_data["stop_details"] = stop_details

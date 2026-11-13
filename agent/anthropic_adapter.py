@@ -661,12 +661,35 @@ def _thinking_kwargs(reasoning_config: dict[str, Any], model: str, effective_max
 # OpenAI tool_choice -> Anthropic; any other string is a forced tool name.
 _TOOL_CHOICE_MAP = {None: {"type": "auto"}, "auto": {"type": "auto"}, "required": {"type": "any"}}
 
+# Providers whose Anthropic-compat endpoint implements the server-side
+# ``web_search_20250305`` tool (opt-in via ``web.server_web_search``).
+_SERVER_WEB_SEARCH_PROVIDERS = frozenset({"minimax", "minimax-oauth"})
+_SERVER_WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+
+
+def _server_web_search_enabled() -> bool:
+    """Boolean variant of the ``_read_config_key`` pattern in agent/web_search_registry.py
+    (``load_config_readonly``; no str.strip — this is a real boolean, not a string key)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cur = load_config_readonly()
+        for segment in ("web", "server_web_search"):
+            if not isinstance(cur, dict):
+                return False
+            cur = cur.get(segment)
+        return cur is True
+    except Exception as exc:
+        logger.debug("Could not read config web.server_web_search: %s", exc)
+        return False
+
 
 def build_anthropic_kwargs(
     model: str, messages: list[dict], tools: Optional[list[dict]], max_tokens: Optional[int],
     reasoning_config: Optional[dict[str, Any]], tool_choice: Optional[str] = None,
     is_oauth: bool = False, preserve_dots: bool = False, context_length: Optional[int] = None,
     base_url: str | None = None, fast_mode: bool = False, drop_context_1m_beta: bool = False,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """Build kwargs for anthropic.messages.create(). ``max_tokens`` is the OUTPUT cap for one
     response; ``context_length`` is the TOTAL window (input + output). ``max_tokens=None`` uses the
@@ -702,6 +725,16 @@ def build_anthropic_kwargs(
             kwargs["tool_choice"] = _TOOL_CHOICE_MAP.get(tool_choice) or {
                 "type": "tool", "name": to_wire(tool_choice) if to_wire else tool_choice
             }
+    # Opt-in server-side web search (MiniMax ``web_search_20250305``): appended AFTER the
+    # tools/tool_choice block so the OAuth wire namer never sees it (no input_schema — the
+    # provider owns the schema). Only when a tools array is actually being sent (or tool_choice
+    # "none" had popped one); forcing tool_choice to auto keeps the server tool callable and
+    # also covers the forced-tool-choice case, where "none"/"tool" would make it unusable.
+    if (provider or "").lower() in _SERVER_WEB_SEARCH_PROVIDERS and _server_web_search_enabled():
+        tools_being_sent = bool(kwargs.get("tools")) or tool_choice == "none"
+        if tools_being_sent:
+            kwargs["tools"] = [*(kwargs.get("tools") or []), dict(_SERVER_WEB_SEARCH_TOOL)]
+            kwargs["tool_choice"] = {"type": "auto"}
     # Map reasoning_config to Anthropic's thinking parameter. Claude 4.6+ models use adaptive thinking +
     # output_config.effort. Older models use manual thinking with budget_tokens. MiniMax's GLOBAL
     # Anthropic-compat endpoint is adaptive too (see _is_minimax_native_adaptive_endpoint); its

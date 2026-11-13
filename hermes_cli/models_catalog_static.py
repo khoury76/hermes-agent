@@ -200,7 +200,7 @@ class _CuratedCatalog(dict):
 _OPENAI_CHAT_MODELS = [
     "gpt-5.4", "gpt-5.4-mini", "gpt-5-mini", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-4.1", "gpt-4o", "gpt-4o-mini",
 ]
-_MINIMAX_MODELS = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"]
+_MINIMAX_MODELS = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1", "MiniMax-M2.1-highspeed", "MiniMax-M2"]
 _TENCENT_MODELS = ["hy4-preview", "hy3", "hy3-preview"]
 # Alibaba DashScope Coding platform (coding-intl): Qwen + third-party (GLM, Kimi, MiniMax, DeepSeek).
 # Classic DashScope keys should override DASHSCOPE_BASE_URL to
@@ -236,7 +236,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
     "gemini": [
         # Argon second: [0] is the silent default when no model is configured, and a flagship never is.
         "gemini-3.8-flash", "gemini-4-argon", "gemini-3.7-flash",
-        "gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3.6-flash", "gemini-3.1-flash-lite-preview",
+        "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.1-flash-lite-preview",
     ],
     "zai": [
         "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "glm-5v-turbo", "glm-5-turbo",
@@ -262,7 +262,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
         "kimi-k3", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview", "kimi-k2-0905-preview",
     ],
     "minimax": list(_MINIMAX_MODELS),
-    "minimax-oauth": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+    "minimax-oauth": ["MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed"],
     "minimax-cn": list(_MINIMAX_MODELS),
     "anthropic": [
         "claude-fable-5.1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5",

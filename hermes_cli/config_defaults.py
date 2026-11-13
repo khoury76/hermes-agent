@@ -406,6 +406,13 @@ DEFAULT_CONFIG = {
         # preview builds). Entries match exactly, as "*.wildcard", or as a domain suffix
         # ("mysite.dev" also covers "preview.mysite.dev"). localhost/private IPs always exempt.
         "cache_exempt_hosts": [],
+        # Opt-in server-side web search on providers that implement the Anthropic
+        # ``web_search_20250305`` server tool (MiniMax). When true AND the active provider is
+        # minimax / minimax-oauth, the adapter appends the server tool to the outbound tools
+        # array and forces tool_choice to auto; search results (sources) come back as
+        # ``server_tool_use`` content blocks and surface in provider_data["web_search_sources"].
+        # No effect on any other provider. Default off.
+        "server_web_search": False,
     },
 
     "browser": {

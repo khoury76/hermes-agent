@@ -620,6 +620,19 @@ terminal:
 #     - ~/code/my-app
 
 # =============================================================================
+# Web Search / Extract Configuration
+# =============================================================================
+# web:
+#   # Opt-in server-side web search for providers that implement the Anthropic
+#   # ``web_search_20250305`` server tool (MiniMax). When true AND the active
+#   # provider is minimax / minimax-oauth, the adapter appends the server tool to
+#   # the outbound tools array and forces tool_choice to auto; the provider runs
+#   # the search itself and results (source URLs) come back as server_tool_use
+#   # content blocks, surfaced in provider_data["web_search_sources"]. No effect
+#   # on any other provider. Default: false.
+#   server_web_search: false
+
+# =============================================================================
 # Browser Tool Configuration
 # =============================================================================
 browser:

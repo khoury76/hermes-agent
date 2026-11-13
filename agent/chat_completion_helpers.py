@@ -1386,7 +1386,8 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         context_length=ctx_len.context_length if ctx_len else None,
         base_url=getattr(agent, "_anthropic_base_url", None),
         fast_mode=request_overrides.get("speed") == "fast",
-        drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
+        drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+        provider=getattr(agent, "provider", None))
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
     # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.
     return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs, api_messages)
@@ -3383,6 +3384,9 @@ class _StreamingCall(StreamingWaitMonitor):
         # No message_stop -> EmptyStreamError; saw_stream_event only picks the message.
         saw_stream_event = False
         saw_message_stop = False
+        # Provider-side web_search (MiniMax web_search_20250305) sources seen on the wire;
+        # merged onto the final message's provider_data next to get_final_message().
+        web_search_sources: list[dict] = []
         self.last_chunk_time["t"] = time.time()
         _diag = self._new_diag()
         self._writer_token = self._attempt_stream_response = None
@@ -3431,13 +3435,25 @@ class _StreamingCall(StreamingWaitMonitor):
                     self._mark_finish_seen(_diag, getattr(getattr(event, "delta", None), "stop_reason", None))
                 elif event_type == "content_block_start":
                     block = getattr(event, "content_block", None)
-                    if block and getattr(block, "type", None) == "tool_use":
+                    block_type = getattr(block, "type", None) if block is not None else None
+                    if block is not None and block_type == "tool_use":
                         has_tool_use = True
                         if getattr(block, "name", None):
                             self._emit_tool_started(block.name)
                             # Same as the chat_completions wire: a stream that dies inside the
                             # tool args is retried (no tool has run yet) instead of stubbed.
                             self.result["partial_tool_names"].append(block.name)
+                    elif block is not None and block_type == "server_tool_use":
+                        # Provider-side tool (MiniMax web_search_20250305): debug breadcrumb +
+                        # harvest sources; NOT client tool_use — has_tool_use stays False so the
+                        # EmptyStreamError gating (client tool_use without stop_reason) is untouched.
+                        from agent.transports.anthropic import _collect_web_search_sources, _log_server_tool_use
+                        from agent.anthropic_message_convert import _to_plain_data
+
+                        block_dict = _to_plain_data(block)
+                        if isinstance(block_dict, dict):
+                            _log_server_tool_use(block_dict)
+                            _collect_web_search_sources(block_dict, web_search_sources)
                 elif event_type == "content_block_delta":
                     delta = getattr(event, "delta", None)
                     delta_type = getattr(delta, "type", None) if delta else None
@@ -3461,6 +3477,26 @@ class _StreamingCall(StreamingWaitMonitor):
                         if saw_stream_event else
                         "Provider returned an empty stream with no events (possible upstream error or malformed event stream).")
                 base_final_message = raw_stream.get_final_message()
+                # Merge any provider-side web_search sources (harvested from server_tool_use
+                # content_block_start events, plus a final scan of the snapshot's blocks) onto
+                # the returned message's provider_data. The anthropic Message model allows
+                # extra attributes, so this is safe on the SDK object; normalize_response
+                # picks provider_data up from there. No-op when the provider sent no
+                # server tools — the attribute is simply never set.
+                if web_search_sources:
+                    from agent.transports.anthropic import _collect_web_search_sources
+                    from agent.anthropic_message_convert import _to_plain_data
+
+                    for block in getattr(base_final_message, "content", None) or []:
+                        block_dict = _to_plain_data(block)
+                        if isinstance(block_dict, dict) and (
+                            block_dict.get("type") == "server_tool_use"
+                            or block_dict.get("server_tool_type") == "web_search_call"
+                        ):
+                            _collect_web_search_sources(block_dict, web_search_sources)
+                    merged = dict(getattr(base_final_message, "provider_data", None) or {})
+                    merged["web_search_sources"] = web_search_sources
+                    base_final_message.provider_data = merged
                 # The SDK snapshot keeps only stop_reason/stop_sequence from message_delta; the
                 # refusal's stop_details (category/explanation) survives only in our accumulator.
                 _stop_details = accumulator.finalize().get("stop_details")

@@ -1548,6 +1548,20 @@ _OPENCODE_FREE_EXCLUDED_MODELS = frozenset(
     {"ox-alpha-free", "deepseek-v4-flash-free", "x-preview-f-free"}
 )
 
+# Provider → ids the catalog still advertises but the endpoint no longer serves, verified by raw
+# probe (HTTP 404 "no longer available"; see /tmp/probe5.txt, /tmp/agnes_retest.py, 2026-11-08
+# sweep). Static edits cover static-only ids; this filter covers live-advertised ids that config
+# cannot suppress (Gemini/Agnes live rows, MiniMax OAuth floor merged back from cache).
+_DELISTED_MODELS: dict[str, frozenset] = {
+    "opencode-zen": _OPENCODE_FREE_EXCLUDED_MODELS,
+    "opencode-go": _OPENCODE_FREE_EXCLUDED_MODELS,
+    "gemini": frozenset({
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-pro-preview",
+    }),
+    "minimax-oauth": frozenset({"minimax-m2", "minimax-m2.1", "minimax-m2.1-highspeed"}),
+    "agnes": frozenset({"agnes-2.5-pro", "agnes-2.5-pro-beta", "agnes-2.0-flash"}),
+}
+
 
 def _catalog_fetcher(normalized: str):
     """The built-in fetcher for *normalized*, else its profile's ``picker_catalog`` hook, else None."""
@@ -1626,10 +1640,11 @@ def merge_profile_catalog(normalized: str, profile, live: Optional[list[str]]) -
 def _drop_delisted_opencode_models(normalized: str, rows: Optional[list[str]]) -> Optional[list[str]]:
     """The relay still LISTS delisted ids it no longer serves, and the curated floor (merged back in
     as the secondary half, or served alone when there is no key) carries retired ids too. Filter the
-    FINAL rows for the live-first Zen/Go pickers so no path can offer a slug that 401s (#111749,
-    #115496)."""
-    if rows and normalized in _LIVE_FIRST_PICKER_PROVIDERS:
-        return type(rows)(m for m in rows if str(m).lower() not in _OPENCODE_FREE_EXCLUDED_MODELS)
+    FINAL rows for any provider with a verified-delisted set so no path can offer a slug that
+    401s/404s (#111749, #115496, 2026-11-08 gemini/minimax-oauth/agnes sweep)."""
+    drop = _DELISTED_MODELS.get(normalized or "")
+    if rows and drop:
+        return type(rows)(m for m in rows if str(m).lower() not in drop)
     return rows
 
 
