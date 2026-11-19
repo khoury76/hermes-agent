@@ -2,6 +2,7 @@
 
 from pm import install_hint
 import asyncio
+from pathlib import Path
 import contextlib
 import logging
 import os
@@ -22,6 +23,87 @@ _CAPTIONABLE_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | {".pdf", ".doc", ".docx", ".txt"
 # Native caption limits (chars): Telegram caps photo/video at 1024; one conservative shared ceiling elsewhere.
 _TELEGRAM_CAPTION_LIMIT = 1024
 _DEFAULT_CAPTION_LIMIT = 4096
+
+# 2026-11-19: files at or above this size are uploaded as ONE buffered multipart body with an
+# explicit Content-Length. PTB hands the body to httpx as a streamed multipart, and on links that
+# reset long writes the upload dies mid-flight ("Timed out" / "Couldn't deliver the file
+# attachment."). Buffering the body lands the request in a single write, which survives it.
+_LARGE_UPLOAD_THRESHOLD = 1024 * 1024
+
+
+class _BufferedUploadResult:
+    """Minimal stand-in for a PTB Message: the senders only read ``message_id`` off it."""
+
+    def __init__(self, message_id):
+        self.message_id = message_id
+
+
+def _telegram_media_kind(ext, is_voice, force_document):
+    """Bot API method family by extension: photo (unless forced document), video, voice note,
+    sendAudio (MP3/M4A only), else document."""
+    return next((k for exts, k in ((() if force_document else _IMAGE_EXTS, "photo"), (_VIDEO_EXTS, "video"),
+                                    (_VOICE_EXTS if is_voice else (), "voice"), (_TELEGRAM_SEND_AUDIO_EXTS, "audio"))
+                 if ext in exts), "document")
+
+
+async def _telegram_buffered_media_upload(bot, chat_id, media_path, *, kind, caption=None, parse_mode=None,
+                                          thread_kwargs=None):
+    """Upload one file as a single buffered multipart body carrying an explicit Content-Length.
+
+    Returns a result object with ``message_id`` on success, or ``None`` when the caller should
+    fall back to the normal PTB upload (never raises for a transport failure).
+    """
+    token = getattr(bot, "token", None)
+    if not token:
+        return None
+    method = {"document": "sendDocument", "photo": "sendPhoto", "video": "sendVideo"}.get(kind)
+    if method is None:
+        return None
+    boundary = "----HermesBoundary7MA4YWxkTrZu0gW"
+    fields = [("chat_id", str(chat_id))]
+    for key, value in (thread_kwargs or {}).items():
+        if value is not None:
+            fields.append((key, str(value)))
+    if caption:
+        fields.append(("caption", caption))
+        if parse_mode:
+            fields.append(("parse_mode", parse_mode))
+    chunks = []
+    for key, value in fields:
+        chunks.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode())
+    chunks.append(
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{kind}\"; filename=\"{os.path.basename(media_path)}\"\r\n"
+         "Content-Type: application/octet-stream\r\n\r\n").encode())
+    try:
+        chunks.append(await asyncio.to_thread(Path(media_path).read_bytes))
+    except OSError as exc:
+        logger.warning("Telegram buffered upload could not read %s: %s", media_path, _sanitize_error_text(exc))
+        return None
+    chunks.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(chunks)
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, connect=30.0)) as client:
+            response = await client.post(
+                url, content=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                         "Content-Length": str(len(body)),
+                         "User-Agent": "curl/8.5.0"})
+        payload = response.json()
+    except Exception as exc:
+        logger.warning("Telegram buffered upload failed for %s: %s", media_path, _sanitize_error_text(exc))
+        return None
+    if not payload.get("ok"):
+        logger.warning("Telegram buffered upload rejected for %s: %s", media_path, payload.get("description"))
+        return None
+    message_id = (payload.get("result") or {}).get("message_id")
+    if message_id is None:
+        return None
+    return _BufferedUploadResult(message_id)
+
 
 
 def _media_caption_split(text, media_files, *, max_caption_len):
@@ -159,9 +241,7 @@ def _adapter_media_method(ext, voice, force_document=False):
 async def _telegram_send_media(bot, chat_id, f, ext, is_voice, force_document, **kwargs):
     """Bot API media method by extension: photo (unless forced document), video, voice note,
     sendAudio (MP3/M4A only), else document."""
-    kind = next((k for exts, k in ((() if force_document else _IMAGE_EXTS, "photo"), (_VIDEO_EXTS, "video"),
-                                    (_VOICE_EXTS if is_voice else (), "voice"), (_TELEGRAM_SEND_AUDIO_EXTS, "audio"))
-                 if ext in exts), "document")
+    kind = _telegram_media_kind(ext, is_voice, force_document)
     return await getattr(bot, f"send_{kind}")(chat_id=chat_id, **{kind: f}, **kwargs)
 
 
@@ -193,6 +273,18 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
     """Upload one file with adapter-matching fallbacks (thread-not-found -> no
     ``message_thread_id``; caption parse failure -> plain caption); retries re-seek the file."""
     ext = os.path.splitext(media_path)[1].lower()
+    kind = _telegram_media_kind(ext, is_voice, force_document)
+    if kind in ("document", "photo", "video"):
+        try:
+            _size = os.path.getsize(media_path)
+        except OSError:
+            _size = 0
+        if _size >= _LARGE_UPLOAD_THRESHOLD:
+            _buffered = await _telegram_buffered_media_upload(
+                bot, chat_id, media_path, kind=kind, caption=caption, parse_mode=parse_mode,
+                thread_kwargs=thread_kwargs)
+            if _buffered is not None:
+                return _buffered
     voice_note = ext in _VOICE_EXTS and is_voice
     # ``caption`` is only set for a single captionable file, so this never double-captions
     # a multi-file send or a voice note.

@@ -500,7 +500,19 @@ _TEXT_SEND_DEADLINE = 30.0
 # `_chat_send_lock`: the lock is released while the abandoned task drains. Awaiting the cancel with a grace
 # period would re-hang the lock on exactly the wedged socket this bounds, so the rare late landing is
 # accepted; httpx's own timeouts free the pool slot.
-_MEDIA_SEND_DEADLINE = 300.0
+_MEDIA_SEND_DEADLINE = 1800.0
+# Per-write stall budget for the request body. httpx applies the read timeout to
+# body writes too, so the old 60 s read budget became a 60 s upload stall bound
+# on slow links. 600 s keeps a healthy slow upload alive while still catching a
+# socket that has stopped raising at all.
+_MEDIA_SEND_WRITE_TIMEOUT = 600.0
+# Large-file upload path (2026-11-19). PTB hands the body to httpx as a streamed
+# multipart stream, and on this host that stream is reset by the network path once
+# the payload exceeds a few MB — reproduced at 6 MB (httpx.ReadError) and 23 MB
+# ("Couldn't deliver the file attachment."). A single-shot body carrying an
+# explicit Content-Length uploads the same 23 MB file in ~10 s, so documents at
+# or above this size bypass PTB and POST a buffered multipart body instead.
+_LARGE_FILE_UPLOAD_THRESHOLD = 1024 * 1024
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
 
@@ -5153,7 +5165,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             chat_id, self._metadata_thread_id(metadata), metadata, reply_to_message_id=reply_to_id, reply_to_mode=self._reply_to_mode)
         return reply_to_id, {
             "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id,
-            "read_timeout": _MEDIA_SEND_READ_TIMEOUT, **thread_kwargs, **self._notification_kwargs(metadata)}
+            "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+            "write_timeout": _MEDIA_SEND_WRITE_TIMEOUT,
+            **thread_kwargs, **self._notification_kwargs(metadata)}
 
     async def _send_media(
         self, send_fn: Any, chat_id: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]], media_label: str,
@@ -5385,10 +5399,102 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         logger.warning("[%s] Failed to send %s: %s", self.name, media_key, _redact_telegram_error_text(e))
         return await fallback
 
+    async def _send_large_document_buffered(
+        self, chat_id: str, file_path: str, caption: Optional[str], file_name: Optional[str],
+        reply_to: Optional[str], metadata: Optional[dict[str, Any]],
+    ) -> Optional[SendResult]:
+        """Upload a large document as one buffered multipart body with an explicit Content-Length.
+
+        PTB streams the multipart body through httpx, and on links that reset long
+        writes the upload dies mid-flight ("Couldn't deliver the file attachment.").
+        Buffering the body and setting Content-Length makes the whole request land in
+        a single write, which survives the same link. Returns ``None`` on any failure
+        so the caller falls back to the normal PTB path.
+        """
+        token = getattr(self._bot, "token", None)
+        if not token:
+            return None
+        try:
+            reply_to_id, base_kwargs = self._media_send_kwargs(chat_id, reply_to, metadata)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[%s] buffered large-document routing failed: %s",
+                           self.name, _redact_telegram_error_text(exc))
+            return None
+
+        fields: list[tuple[str, str]] = [("chat_id", str(base_kwargs.get("chat_id")))]
+        for key in ("message_thread_id", "direct_messages_topic_id"):
+            value = base_kwargs.get(key)
+            if value is not None:
+                fields.append((key, str(value)))
+        if reply_to_id is not None:
+            fields.append(("reply_to_message_id", str(reply_to_id)))
+        if base_kwargs.get("disable_notification"):
+            fields.append(("disable_notification", "true"))
+        capped_caption = self._caption_1024(caption)
+        if capped_caption:
+            fields.append(("caption", capped_caption))
+
+        boundary = "----HermesBoundary7MA4YWxkTrZu0gW"
+        chunks: list[bytes] = []
+        for key, value in fields:
+            chunks.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode())
+        upload_name = file_name or os.path.basename(file_path)
+        chunks.append(
+            (f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{upload_name}\"\r\n"
+             "Content-Type: application/octet-stream\r\n\r\n").encode())
+        try:
+            chunks.append(await asyncio.to_thread(_Path(file_path).read_bytes))
+        except OSError as exc:
+            logger.warning("[%s] buffered large-document read failed: %s",
+                           self.name, _redact_telegram_error_text(exc))
+            return None
+        chunks.append(f"\r\n--{boundary}--\r\n".encode())
+        body = b"".join(chunks)
+
+        url = f"https://api.telegram.org/bot{token}/sendDocument"
+        try:
+            import httpx
+
+            timeout = httpx.Timeout(_MEDIA_SEND_WRITE_TIMEOUT, connect=30.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    url, content=body,
+                    headers={
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        "Content-Length": str(len(body)),
+                        "User-Agent": "curl/8.5.0",
+                    })
+            payload = response.json()
+        except Exception as exc:
+            logger.warning("[%s] buffered large-document upload failed: %s",
+                           self.name, _redact_telegram_error_text(exc))
+            return None
+        if not payload.get("ok"):
+            logger.warning("[%s] buffered large-document upload rejected: %s",
+                           self.name, payload.get("description"))
+            return None
+        result = payload.get("result") or {}
+        message_id = result.get("message_id")
+        if message_id is None:
+            return None
+        return SendResult(success=True, message_id=str(message_id))
+
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
+        # Large bodies: streamed multipart gets reset on slow/reset-prone links —
+        # post one buffered body with an explicit Content-Length instead.
+        try:
+            large = os.path.getsize(file_path) >= _LARGE_FILE_UPLOAD_THRESHOLD
+        except OSError:
+            large = False
+        if large and self._bot:
+            buffered = await self._send_large_document_buffered(
+                chat_id, file_path, caption, file_name, reply_to, metadata)
+            if buffered is not None:
+                return buffered
         return await self._send_local_file(
             "File", file_path, chat_id, reply_to, metadata, "document",
             lambda f: {"document": f, "filename": file_name or os.path.basename(file_path), "caption": self._caption_1024(caption)},
